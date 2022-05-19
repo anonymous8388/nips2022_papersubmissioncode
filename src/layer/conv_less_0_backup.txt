@@ -1,0 +1,878 @@
+// Tencent is pleased to support the open source community by making ncnn available.
+//
+// Copyright (C) 2017 THL A29 Limited, a Tencent company. All rights reserved.
+//
+// Licensed under the BSD 3-Clause License (the "License"); you may not use this file except
+// in compliance with the License. You may obtain a copy of the License at
+//
+// https://opensource.org/licenses/BSD-3-Clause
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+// CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+
+#include "convolution.h"
+
+#include "layer_type.h"
+
+#include "fused_activation.h"
+
+namespace ncnn {
+
+Convolution::Convolution()
+{
+    one_blob_only = true;
+    support_inplace = false;
+}
+
+int Convolution::load_param(const ParamDict& pd)
+{
+    num_output = pd.get(0, 0);
+    kernel_w = pd.get(1, 0);
+    kernel_h = pd.get(11, kernel_w);
+    dilation_w = pd.get(2, 1);
+    dilation_h = pd.get(12, dilation_w);
+    stride_w = pd.get(3, 1);
+    stride_h = pd.get(13, stride_w);
+    pad_left = pd.get(4, 0);
+    pad_right = pd.get(15, pad_left);
+    pad_top = pd.get(14, pad_left);
+    pad_bottom = pd.get(16, pad_top);
+    pad_value = pd.get(18, 0.f);
+    bias_term = pd.get(5, 0);
+    weight_data_size = pd.get(6, 0);
+    int8_scale_term = pd.get(8, 0);
+    activation_type = pd.get(9, 0);
+    activation_params = pd.get(10, Mat());
+
+    dynamic_weight = pd.get(19, 0);
+
+    record1 = Mat();
+    record2 = Mat();
+    record3 =Mat();
+    record4 = Mat();
+
+    if (dynamic_weight)
+    {
+        one_blob_only = false;
+    }
+
+    if (int8_scale_term)
+    {
+#if NCNN_INT8
+        support_int8_storage = true;
+#else
+        NCNN_LOGE("please build ncnn with NCNN_INT8 enabled for int8 inference");
+        return -1;
+#endif
+    }
+
+    return 0;
+}
+
+int Convolution::load_model(const ModelBin& mb)
+{
+    if (dynamic_weight)
+        return 0;
+
+    weight_data = mb.load(weight_data_size, 0);
+    if (weight_data.empty())
+        return -100;
+
+    if (bias_term)
+    {
+        bias_data = mb.load(num_output, 1);
+        if (bias_data.empty())
+            return -100;
+    }
+
+#if NCNN_INT8
+    if (int8_scale_term)
+    {
+        weight_data_int8_scales = mb.load(num_output, 1);
+        bottom_blob_int8_scales = mb.load(1, 1);
+    }
+
+    if (int8_scale_term > 100)
+    {
+        top_blob_int8_scales = mb.load(1, 1);
+    }
+#endif // NCNN_INT8
+
+    return 0;
+}
+
+int Convolution::create_pipeline(const Option& opt)
+{
+    if (dynamic_weight)
+        return 0;
+
+#if NCNN_INT8
+    // runtime quantize the weight data
+    if (opt.use_int8_inference && weight_data.elemsize == (size_t)4u && int8_scale_term)
+    {
+        const int maxk = kernel_w * kernel_h;
+        const int num_input = weight_data_size / num_output / maxk;
+
+        Mat weight_data_r2 = weight_data.reshape(maxk, num_input, num_output);
+
+        Mat weight_data_int8;
+
+        Option opt_q = opt;
+        opt_q.blob_allocator = weight_data.allocator;
+        opt_q.use_packing_layout = false;
+        quantize_to_int8(weight_data_r2, weight_data_int8, weight_data_int8_scales, opt_q);
+        if (weight_data_int8.empty())
+            return -100;
+
+        weight_data = weight_data_int8.reshape(weight_data_size);
+    }
+#endif // NCNN_INT8
+
+    return 0;
+}
+
+
+void pretty_print(const ncnn::Mat& m)
+{
+    for (int q=0; q<m.c; q++)
+    {
+        const float* ptr = m.channel(q);
+        for (int y=0; y<m.h; y++)
+        {
+            for (int x=0; x<m.w; x++)
+            {
+                printf("%.4f ", ptr[x]);
+            }
+            ptr += m.w;
+            //            printf("\n");
+        }
+        printf("------------------------\n");
+    }
+}
+
+
+static int convolution(const Mat& in_x, Mat& out_y, const Mat& weight_data, const Mat& bias_data,
+                       int kernel_w, int kernel_h, int stride_w, int stride_h, int dilation_w, int dilation_h,
+                       int activation_type, const Mat& activation_params, const Option& opt, Mat& x_unit_mat, Mat& w_0_area_mat, Mat& w_unit_mat, Mat& b_unit_mat)
+{
+    //    fprintf(stderr, "卷卷卷@@raw conv, activation type is %d\n", activation_type);
+    const int w = in_x.w;
+    const int inch = in_x.c;
+
+    const int outw = out_y.w;
+    const int outh = out_y.h;
+    const int outch = out_y.c;
+
+    const int bias_term = bias_data.empty() ? 0 : 1;
+
+    const int maxk = kernel_w * kernel_h;
+
+    // kernel offsets
+    std::vector<int> _space_ofs(maxk);
+    int* space_ofs = &_space_ofs[0];
+    {
+        int p1 = 0;
+        int p2 = 0;
+        int gap = w * dilation_h - kernel_w * dilation_w;
+        for (int i = 0; i < kernel_h; i++)
+        {
+            for (int j = 0; j < kernel_w; j++)
+            {
+                space_ofs[p1] = p2;
+                p1++;
+                p2 += dilation_w;
+            }
+            p2 += gap;
+        }
+    }
+
+    fprintf(stderr, "\n-----层-----\n");
+//    pretty_print(in_x);
+    if (w_unit_mat.total() <= 0){
+        w_unit_mat.clone_from(weight_data);     // 单位化w
+        w_0_area_mat.clone_from(weight_data);   // w的小于0区域
+        x_unit_mat.clone_from(in_x);            // 单位化x
+        b_unit_mat.clone_from(bias_data);
+
+        bool print_w_unit_flag = true;
+        double avg = 0.0;
+        double n_count = 1.0;
+
+        for (int k=0; k<outch; k++){
+//            fprintf(stderr, "bias_data[k]=%f\n",bias_data[k]);
+            /**
+             * 计算w_k的模长
+             */
+            const float* kptr = (const float*)weight_data.data + maxk * inch * k;
+            double w_k_norm2 = bias_data[k] * bias_data[k];
+
+            for (int q = 0; q < inch; q++){
+                for (int w_i = 0; w_i < maxk; w_i++){
+                    w_k_norm2 += kptr[w_i]*kptr[w_i];
+                }
+                kptr += maxk;
+            }
+
+            /**
+             * 单位化w_k
+             */
+//             double verify = 0.0;
+            float* kptr_unit = (float*)w_unit_mat.data + maxk * inch * k;
+            for (int q = 0; q < inch; q++){
+                for (int w_i = 0; w_i < maxk; w_i++){
+                    kptr_unit[w_i] /= sqrt(w_k_norm2);
+//                    verify += kptr_unit[w_i] * kptr_unit[w_i];
+                }
+                kptr_unit += maxk;
+            }
+//            fprintf(stderr, "%f\n", verify);
+
+            /**
+             * norm bias
+             */
+            b_unit_mat[k] /= sqrt(w_k_norm2);
+
+
+            /**
+             * 计算小于0区域
+             */
+            double max_kernel = 9.0;
+            double min_kernel = 9.0;
+            float* kptr_0_area = (float*)w_0_area_mat.data + maxk * inch * k;
+            kptr_unit = (float*)w_unit_mat.data + maxk * inch * k;
+            for (int q = 0; q < inch; q++){
+                for (int w_i = 0; w_i < maxk; w_i++){
+                    kptr_0_area[w_i] = sqrt(1.0 - kptr_unit[w_i]*kptr_unit[w_i]);
+
+                    if (max_kernel > 1){
+                        max_kernel = kptr_unit[w_i];
+                        min_kernel = kptr_unit[w_i];
+                    }else{
+                        if (abs(max_kernel) <= abs(kptr_unit[w_i]))
+                            max_kernel = kptr_unit[w_i];
+
+                        if (abs(min_kernel) >= abs(kptr_unit[w_i]))
+                            min_kernel = kptr_unit[w_i];
+                    }
+//                    if (print_w_unit_flag)
+//                        fprintf(stderr, "%f,",kptr_0_area[w_i]);
+                }
+//                fprintf(stderr, "\n");
+                kptr_0_area += maxk;
+                kptr_unit += maxk;
+            }
+//            if(print_w_unit_flag)
+//                fprintf(stderr, "%f\n",abs(max_kernel));
+
+//            print_w_unit_flag = false;
+//            fprintf(stderr, "我的最小值是%f\n",min_kernel);
+//            fprintf(stderr, "\n");
+
+            avg += abs(max_kernel);
+            n_count += 1;
+        }
+
+        fprintf(stderr, "%f\n",abs(avg/n_count));
+
+        /**
+         * exact compute
+         */
+        for (int i = 0; i < outh; i++)
+        {
+            for (int j = 0; j < outw; j++)
+            {
+                for (int k = 0; k < outch; k++)
+                {
+                    float* outptr = out_y.channel(k);
+                    outptr += i * outw;
+
+                    float y_kij = 0.f;
+
+                    if (bias_term)
+                        y_kij = bias_data[k];
+                    else
+                        fprintf(stderr, "no bias\n");
+
+                    const float* kptr = (const float*)weight_data + maxk * inch * k;
+
+                    for (int q = 0; q < inch; q++)
+                    {
+                        const Mat& m = in_x.channel(q);
+                        const float* sptr = m.row(i * stride_h) + j * stride_w;
+
+                        for (int w_i = 0; w_i < maxk; w_i++) // 29.23
+                        {
+                            float val = sptr[space_ofs[w_i]]; // 20.72
+                            float wt = kptr[w_i];
+                            y_kij += val * wt; // 41.45
+                        }
+                        kptr += maxk;
+                    }
+                    outptr[j] = activation_ss(y_kij, activation_type, activation_params);
+                }
+            }
+        }
+        //        fprintf(stderr, "less 0 count = %d\n",less_0_count);
+    }else{
+        //        fprintf(stderr, "啊啊啊啊啊\n");
+        bool print_x_flag = false;
+        float reduced_count = 0.0;
+        float total_count = 0.0;
+        for (int i = 0; i < outh; i++)
+        {
+            for (int j = 0; j < outw; j++)
+            {
+                /**
+                 * 计算x norm
+                 */
+                double x_norm_k = 1.0;
+                for (int q = 0; q < inch; q++)
+                {
+                    const Mat& x = in_x.channel(q);
+                    const float* x_ptr = x.row(i * stride_h) + j * stride_w;
+
+                    Mat x_unit = x_unit_mat.channel(q);
+                    float* unit_x_ptr = x_unit.row(i * stride_h) + j * stride_w;
+
+                    for (int w_i = 0; w_i < maxk; w_i++)
+                    {
+                        x_norm_k += x_ptr[space_ofs[w_i]] * x_ptr[space_ofs[w_i]];
+                        unit_x_ptr[space_ofs[w_i]] =  x_ptr[space_ofs[w_i]];
+                    }
+                }
+
+                /**
+                 * 单位化x
+                 */
+                for (int q = 0; q < inch; q++)
+                {
+                    Mat x_unit = x_unit_mat.channel(q);
+                    float* unit_x_ptr = x_unit.row(i * stride_h) + j * stride_w;
+
+                    for (int w_i = 0; w_i < maxk; w_i++)
+                    {
+                        unit_x_ptr[space_ofs[w_i]] /= sqrt(x_norm_k);
+                        if (print_x_flag)
+                            fprintf(stderr, "%.4f, ", unit_x_ptr[space_ofs[w_i]]);
+                    }
+                    if (print_x_flag)
+                        fprintf(stderr, "\n");
+                }
+
+                if (print_x_flag)
+                    fprintf(stderr, "\n\n");
+                print_x_flag = false;
+
+                /**
+                 * 对于每个w_k
+                 */
+                for (int k = 0; k < outch; k++)
+                {
+                    float* outptr = out_y.channel(k);
+                    outptr += i * outw;
+                    float y_kij = 0.f;
+
+                    if (bias_term)
+                        y_kij = bias_data[k];
+
+                    /**
+                     * 比较每个单
+                     */
+                    const float* w_0_area_ptr = (const float*)w_unit_mat + maxk * inch * k;
+//                    const float* kptr = (const float*)weight_data.data + maxk * inch * k;
+                    double w_k_norm2 = 0.0;
+
+                    for (int q = 0; q < inch; q++){
+                        for (int w_i = 0; w_i < maxk; w_i++){
+                            w_k_norm2 += w_0_area_ptr[w_i]*w_0_area_ptr[w_i];
+                        }
+                        w_0_area_ptr += maxk;
+                    }
+
+                    total_count += 1;
+                    bool skip_flag = false;
+
+//                    fprintf(stderr, "record4=%.4f, b_min=%.4f\n", 1.0/sqrt(x_norm_k), -sqrt(w_k_norm2));
+                    if (1.0/sqrt(x_norm_k) <= -sqrt(w_k_norm2)){
+//                        fprintf(stderr, "record4=%.4f, b_min=%.4f", b_unit_mat[k], sqrt(w_k_norm2));
+                        skip_flag = true;
+                    }
+
+//                    double max_kernel = 9.0;
+//                    double min_kernel = 9.0;
+//                    for (int q = 0; q < inch; q++)
+//                    {
+//                        if (skip_flag)
+//                            break;
+//                        Mat x_unit = x_unit_mat.channel(q);
+//                        float* x_unit_ptr = x_unit.row(i * stride_h) + j * stride_w;
+//                        for (int w_i = 0; w_i < maxk; w_i++)
+//                        {
+//                            if (skip_flag)
+//                                break;
+////                            fprintf(stderr, "sign=%d, x_unit=%f, w_0_area=%f\n", kptr[w_i] >=0, x_unit_ptr[space_ofs[w_i]], w_0_area_ptr[w_i]);
+//                            if (
+//                                (kptr[w_i] >=0 && x_unit_ptr[space_ofs[w_i]] <= -w_0_area_ptr[w_i])
+//                                ||
+//                                (kptr[w_i] <0 && x_unit_ptr[space_ofs[w_i]] >= w_0_area_ptr[w_i])
+//                            ){
+//                                skip_flag = true;
+//                            }
+//
+////                            if (w_0_area_ptr[w_i] <= 0.7)
+////                                fprintf(stderr, "x_unit=%f,w_0_area=%f\n", x_unit_ptr[space_ofs[w_i]], w_0_area_ptr[w_i]);
+//
+//
+//                            if (max_kernel > 1){
+//                                max_kernel = x_unit_ptr[space_ofs[w_i]];
+//                                min_kernel = x_unit_ptr[space_ofs[w_i]];
+//                            }else{
+//                                if (abs(max_kernel) <= abs(x_unit_ptr[space_ofs[w_i]]))
+//                                    max_kernel = x_unit_ptr[space_ofs[w_i]];
+//
+//                                if (abs(min_kernel) >= abs(x_unit_ptr[space_ofs[w_i]]))
+//                                    min_kernel = x_unit_ptr[space_ofs[w_i]];
+//                            }
+//                        }
+//                        w_0_area_ptr += maxk;
+//                        kptr += maxk;
+//                    }
+//                    fprintf(stderr, "我的最大值是%f\n",max_kernel);
+//                    fprintf(stderr, "我的最小值是%f\n",min_kernel);
+
+                    if (skip_flag){
+//                        reduced_count += 1;
+                        outptr[j] = 0;
+                    }else{
+                        const float * kptr = (const float*)weight_data + maxk * inch * k;
+                        double cos_theta = 0.0;
+                        for (int q = 0; q < inch; q++)
+                        {
+                            const Mat& m = in_x.channel(q);
+                            const float* sptr = m.row(i * stride_h) + j * stride_w;
+
+
+                            for (int w_i = 0; w_i < maxk; w_i++) // 29.23
+                            {
+                                float val = sptr[space_ofs[w_i]]; // 20.72
+                                float wt = kptr[w_i];
+                                y_kij += val * wt; // 41.45
+                            }
+
+                            kptr += maxk;
+                        }
+                        outptr[j] = activation_ss(y_kij, activation_type, activation_params);
+                        if (outptr[j] <= 0)
+                            reduced_count+=1;
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "sparsity=%.4f, \n",reduced_count/total_count);
+    }
+
+
+    return 0;
+}
+
+// 保留原来的convolution
+static int convolution(const Mat& bottom_blob, Mat& top_blob, const Mat& weight_data, const Mat& bias_data, int kernel_w, int kernel_h, int stride_w, int stride_h, int dilation_w, int dilation_h, int activation_type, const Mat& activation_params, const Option& opt)
+{
+    const int w = bottom_blob.w;
+    const int inch = bottom_blob.c;
+
+    const int outw = top_blob.w;
+    const int outh = top_blob.h;
+    const int outch = top_blob.c;
+
+    const int bias_term = bias_data.empty() ? 0 : 1;
+
+    const int maxk = kernel_w * kernel_h;
+
+    // kernel offsets
+    std::vector<int> _space_ofs(maxk);
+    int* space_ofs = &_space_ofs[0];
+    {
+        int p1 = 0;
+        int p2 = 0;
+        int gap = w * dilation_h - kernel_w * dilation_w;
+        for (int i = 0; i < kernel_h; i++)
+        {
+            for (int j = 0; j < kernel_w; j++)
+            {
+                space_ofs[p1] = p2;
+                p1++;
+                p2 += dilation_w;
+            }
+            p2 += gap;
+        }
+    }
+
+    //    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int i = 0; i < outh; i++)
+    {
+        for (int j = 0; j < outw; j++)
+        {
+            for (int k = 0; k < outch; k++)
+            {
+                float* outptr = top_blob.channel(k);
+                outptr += i * outw;
+
+                float y_kij = 0.f;
+
+                if (bias_term)
+                    y_kij = bias_data[k];
+
+                const float* kptr = (const float*)weight_data + maxk * inch * k;
+
+                for (int q = 0; q < inch; q++)
+                {
+                    const Mat m = bottom_blob.channel(q);
+                    const float* sptr = m.row(i * stride_h) + j * stride_w;
+
+                    for (int w_i = 0; w_i < maxk; w_i++) // 29.23
+                    {
+                        float val = sptr[space_ofs[w_i]]; // 20.72
+                        float wt = kptr[w_i];
+                        y_kij += val * wt; // 41.45
+
+                    }
+
+                    kptr += maxk;
+                }
+
+                outptr[j] = activation_ss(y_kij, activation_type, activation_params);
+            }
+        }
+    }
+
+    return 0;
+}
+
+int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt)
+{
+#if NCNN_INT8
+    if (opt.use_int8_inference && weight_data.elemsize == (size_t)1u)
+    {
+        return forward_int8(bottom_blob, top_blob, opt);
+    }
+#endif
+
+    // flattened blob, implement as InnerProduct
+    if (bottom_blob.dims == 1 && kernel_w == 1 && kernel_h == 1)
+    {
+        int num_input = weight_data_size / num_output;
+        if (bottom_blob.w * bottom_blob.elempack == num_input)
+        {
+            // call InnerProduct
+            ncnn::Layer* op = ncnn::create_layer(ncnn::LayerType::InnerProduct);
+
+            // set param
+            ncnn::ParamDict pd;
+            pd.set(0, num_output);
+            pd.set(1, bias_term);
+            pd.set(2, weight_data_size);
+            pd.set(8, int8_scale_term);
+            pd.set(9, activation_type);
+            pd.set(10, activation_params);
+
+            op->load_param(pd);
+
+            // set weights
+            ncnn::Mat weights[4];
+            weights[0] = weight_data;
+            weights[1] = bias_data;
+
+#if NCNN_INT8
+            if (int8_scale_term)
+            {
+                weights[2] = weight_data_int8_scales;
+                weights[3] = bottom_blob_int8_scales;
+            }
+#endif
+
+            op->load_model(ModelBinFromMatArray(weights));
+
+            op->create_pipeline(opt);
+
+            // forward
+            op->forward(bottom_blob, top_blob, opt);
+
+            op->destroy_pipeline(opt);
+
+            delete op;
+
+            return 0;
+        }
+    }
+
+    Mat bottom_blob_bordered;
+    make_padding(bottom_blob, bottom_blob_bordered, opt);
+    if (bottom_blob_bordered.empty())
+        return -100;
+
+    const int w = bottom_blob_bordered.w;
+    const int h = bottom_blob_bordered.h;
+    const size_t elemsize = bottom_blob_bordered.elemsize;
+
+    const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+    const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+    const int outw = (w - kernel_extent_w) / stride_w + 1;
+    const int outh = (h - kernel_extent_h) / stride_h + 1;
+
+    top_blob.create(outw, outh, num_output, elemsize, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    int ret;
+    if (opt.use_reserved_0){
+        ret = convolution(bottom_blob_bordered, top_blob,
+                          weight_data, bias_data, kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h, activation_type, activation_params, opt,
+                          record1, record2, record3, record4);
+    }else{
+        ret = convolution(bottom_blob_bordered, top_blob,
+                          weight_data, bias_data, kernel_w, kernel_h, stride_w, stride_h, dilation_w, dilation_h, activation_type, activation_params, opt);
+    }
+    if (ret != 0)
+        return ret;
+
+    return 0;
+}
+
+int Convolution::forward(const std::vector<Mat>& bottom_blobs, std::vector<Mat>& top_blobs, const Option& opt)
+{
+    const Mat& bottom_blob = bottom_blobs[0];
+    const Mat& _weight_data = bottom_blobs[1];
+    Mat& top_blob = top_blobs[0];
+
+    const int _kernel_w = _weight_data.w;
+    const int _kernel_h = _weight_data.h;
+    const int _num_output = _weight_data.c;
+
+    Mat weight_data_flattened;
+    flatten(_weight_data, weight_data_flattened, opt);
+    if (weight_data_flattened.empty())
+        return -100;
+
+    Mat bias_data_flattened;
+    if (bias_term)
+    {
+        const Mat& _bias_data = bottom_blobs[2];
+        flatten(_bias_data, bias_data_flattened, opt);
+        if (bias_data_flattened.empty())
+            return -100;
+    }
+
+    Mat bottom_blob_bordered;
+    make_padding(bottom_blob, bottom_blob_bordered, _kernel_w, _kernel_h, opt);
+    if (bottom_blob_bordered.empty())
+        return -100;
+
+    const int w = bottom_blob_bordered.w;
+    const int h = bottom_blob_bordered.h;
+    const size_t elemsize = bottom_blob_bordered.elemsize;
+
+    const int kernel_extent_w = dilation_w * (_kernel_w - 1) + 1;
+    const int kernel_extent_h = dilation_h * (_kernel_h - 1) + 1;
+
+    const int outw = (w - kernel_extent_w) / stride_w + 1;
+    const int outh = (h - kernel_extent_h) / stride_h + 1;
+
+    top_blob.create(outw, outh, _num_output, elemsize, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+    int ret = convolution(bottom_blob_bordered, top_blob, weight_data_flattened, bias_data_flattened, _kernel_w, _kernel_h,
+                          stride_w, stride_h, dilation_w, dilation_h, activation_type, activation_params, opt);
+//                          record1, record2, record3, record4);
+    if (ret != 0)
+        return ret;
+
+    return 0;
+}
+
+void Convolution::make_padding(const Mat& bottom_blob, Mat& bottom_blob_bordered, const Option& opt) const
+{
+    make_padding(bottom_blob, bottom_blob_bordered, kernel_w, kernel_h, opt);
+}
+
+void Convolution::make_padding(const Mat& bottom_blob, Mat& bottom_blob_bordered, int _kernel_w, int _kernel_h, const Option& opt) const
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+
+    const int kernel_extent_w = dilation_w * (_kernel_w - 1) + 1;
+    const int kernel_extent_h = dilation_h * (_kernel_h - 1) + 1;
+
+    bottom_blob_bordered = bottom_blob;
+    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
+    {
+        Option opt_b = opt;
+        opt_b.blob_allocator = opt.workspace_allocator;
+        copy_make_border(bottom_blob, bottom_blob_bordered, pad_top, pad_bottom, pad_left, pad_right, BORDER_CONSTANT, pad_value, opt_b);
+    }
+    else if (pad_left == -233 && pad_right == -233 && pad_top == -233 && pad_bottom == -233)
+    {
+        // tensorflow padding=SAME or onnx padding=SAME_UPPER
+        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
+        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
+        if (wpad > 0 || hpad > 0)
+        {
+            Option opt_b = opt;
+            opt_b.blob_allocator = opt.workspace_allocator;
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, pad_value, opt_b);
+        }
+    }
+    else if (pad_left == -234 && pad_right == -234 && pad_top == -234 && pad_bottom == -234)
+    {
+        // onnx padding=SAME_LOWER
+        int wpad = kernel_extent_w + (w - 1) / stride_w * stride_w - w;
+        int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
+        if (wpad > 0 || hpad > 0)
+        {
+            Option opt_b = opt;
+            opt_b.blob_allocator = opt.workspace_allocator;
+            copy_make_border(bottom_blob, bottom_blob_bordered, hpad - hpad / 2, hpad / 2, wpad - wpad / 2, wpad / 2, BORDER_CONSTANT, pad_value, opt_b);
+        }
+    }
+}
+
+#if NCNN_INT8
+static inline signed char float2int8(float v)
+{
+    int int32 = static_cast<int>(round(v));
+    if (int32 > 127) return 127;
+    if (int32 < -127) return -127;
+    return (signed char)int32;
+}
+
+int Convolution::forward_int8(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+    int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
+
+    //     NCNN_LOGE("Convolution input %d x %d  ksize=%d %d  stride=%d %d", w, h, kernel_w, kernel_h, stride_w, stride_h);
+
+    const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+    const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+    Mat bottom_blob_unbordered = bottom_blob;
+    if (elemsize != 1)
+    {
+        Option opt_g = opt;
+        opt_g.blob_allocator = opt.workspace_allocator;
+
+        quantize_to_int8(bottom_blob, bottom_blob_unbordered, bottom_blob_int8_scales, opt_g);
+    }
+
+    Mat bottom_blob_bordered;
+    make_padding(bottom_blob_unbordered, bottom_blob_bordered, opt);
+    if (bottom_blob_bordered.empty())
+        return -100;
+
+    w = bottom_blob_bordered.w;
+    h = bottom_blob_bordered.h;
+
+    int outw = (w - kernel_extent_w) / stride_w + 1;
+    int outh = (h - kernel_extent_h) / stride_h + 1;
+
+    const int maxk = kernel_w * kernel_h;
+
+    // kernel offsets
+    std::vector<int> _space_ofs(maxk);
+    int* space_ofs = &_space_ofs[0];
+    {
+        int p1 = 0;
+        int p2 = 0;
+        int gap = w * dilation_h - kernel_w * dilation_w;
+        for (int i = 0; i < kernel_h; i++)
+        {
+            for (int j = 0; j < kernel_w; j++)
+            {
+                space_ofs[p1] = p2;
+                p1++;
+                p2 += dilation_w;
+            }
+            p2 += gap;
+        }
+    }
+
+    // int8
+    bool use_int8_requantize = int8_scale_term > 100;
+    size_t out_elemsize = use_int8_requantize ? 1u : 4u;
+
+    top_blob.create(outw, outh, num_output, out_elemsize, opt.blob_allocator);
+    if (top_blob.empty())
+        return -100;
+
+// num_output
+#pragma omp parallel for num_threads(opt.num_threads)
+    for (int p = 0; p < num_output; p++)
+    {
+        signed char* outptr = top_blob.channel(p);
+
+        for (int i = 0; i < outh; i++)
+        {
+            for (int j = 0; j < outw; j++)
+            {
+                int sum = 0;
+
+                const signed char* kptr = (const signed char*)weight_data + maxk * channels * p;
+
+                // channels
+                for (int q = 0; q < channels; q++)
+                {
+                    const Mat m = bottom_blob_bordered.channel(q);
+                    const signed char* sptr = m.row<signed char>(i * stride_h) + j * stride_w;
+
+                    for (int k = 0; k < maxk; k++)
+                    {
+                        int val = sptr[space_ofs[k]];
+                        int wt = kptr[k];
+                        sum += val * wt;
+                    }
+
+                    kptr += maxk;
+                }
+
+                float scale_in;
+                if (weight_data_int8_scales[p] == 0)
+                    scale_in = 0;
+                else
+                    scale_in = 1.f / (bottom_blob_int8_scales[0] * weight_data_int8_scales[p]);
+
+                float sumfp32 = sum * scale_in;
+
+                if (bias_term)
+                    sumfp32 += bias_data[p];
+
+                sumfp32 = activation_ss(sumfp32, activation_type, activation_params);
+
+                if (use_int8_requantize)
+                {
+                    // requantize
+                    float scale_out = top_blob_int8_scales[0];
+                    signed char sums8 = float2int8(sumfp32 * scale_out);
+                    outptr[0] = sums8;
+                    outptr += 1;
+                }
+                else
+                {
+                    // dequantize
+                    ((float*)outptr)[0] = sumfp32;
+                    outptr += 4;
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+#endif // NCNN_INT8
+
+} // namespace ncnn
